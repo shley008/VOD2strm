@@ -10,7 +10,6 @@ import unicodedata
 from pathlib import Path
 from datetime import datetime
 import fnmatch
-import hashlib
 
 import requests
 
@@ -420,16 +419,19 @@ def write_strm(path: Path, url: str) -> None:
 
 
 def normalize_host_for_proxy(base: str) -> str:
-    host = (base or "").strip()
+    """
+    Return the Dispatcharr base URL to place inside STRM files.
+
+    This intentionally preserves the scheme from VOD2strm_vars.sh. For example,
+    if DISPATCHARR_BASE_URL is https://dispatcharr.falconridge.it, STRM files
+    will use https://dispatcharr.falconridge.it.
+    """
+    host = (base or "").strip().rstrip("/")
     if not host:
         return ""
-    host = host.rstrip("/")
-    if host.startswith("http://"):
-        host = host[len("http://"):]
-    elif host.startswith("https://"):
-        host = host[len("https://"):]
-    host = "http://" + host
-    return host
+    if host.startswith("http://") or host.startswith("https://"):
+        return host
+    return "http://" + host
 
 
 # ------------------------------------------------------------
@@ -468,6 +470,69 @@ def get_movies_for_account(base: str, token: str, account_id: int, page_size: in
             yield m
 
 
+def api_get_movie_provider_info(base: str, token: str, movie_id: int | str) -> dict:
+    """
+    Fetch provider details for a Dispatcharr movie. This is where Dispatcharr
+    exposes provider/XC identifiers such as stream_id when they are not present
+    on /api/vod/movies/.
+    """
+    if not movie_id:
+        return {}
+    data = api_get(base, token, f"/api/vod/movies/{movie_id}/provider-info/")
+    if not data or not isinstance(data, dict):
+        return {}
+    return data
+
+
+def _find_first_key_recursive(obj, key_names: set[str]):
+    """Find the first non-empty value for any key name in a nested dict/list."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if str(k).lower() in key_names and v not in (None, ""):
+                return v
+        for v in obj.values():
+            found = _find_first_key_recursive(v, key_names)
+            if found not in (None, ""):
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = _find_first_key_recursive(item, key_names)
+            if found not in (None, ""):
+                return found
+    return None
+
+
+def get_movie_stream_id(base: str, token: str, movie: dict) -> int | str | None:
+    """
+    Resolve the provider stream_id for a movie using Dispatcharr's API.
+
+    The movie list schema does not always include stream_id, so we first check
+    the movie object and then query /api/vod/movies/<id>/provider-info/.
+    The returned provider-info is merged into the movie dict so future calls and
+    cache writes can reuse it.
+    """
+    stream_id = _find_first_key_recursive(
+        movie,
+        {"stream_id", "streamid", "provider_stream_id", "providerstreamid"},
+    )
+    if stream_id not in (None, ""):
+        return stream_id
+
+    movie_id = movie.get("id")
+    provider_info = api_get_movie_provider_info(base, token, movie_id)
+    if provider_info:
+        movie["_provider_info"] = provider_info
+        stream_id = _find_first_key_recursive(
+            provider_info,
+            {"stream_id", "streamid", "provider_stream_id", "providerstreamid"},
+        )
+        if stream_id not in (None, ""):
+            movie["stream_id"] = stream_id
+            return stream_id
+
+    return None
+
+
 # ------------------------------------------------------------
 # Dispatcharr API: Series + provider-info (per account)
 # ------------------------------------------------------------
@@ -482,36 +547,6 @@ def get_series_for_account(base: str, token: str, account_id: int, page_size: in
     ):
         for s in page:
             yield s
-
-
-def get_episodes_for_series(base: str, token: str, series_id: int, page_size: int = 250):
-    """
-    Return Dispatcharr Episode objects for a Series.
-
-    These Episode objects have their own UUIDs, and Dispatcharr's VOD proxy
-    expects TV STRMs to use content_type=episode with the episode UUID.
-    """
-    path = f"/api/vod/episodes/?series={series_id}"
-    for page in api_paginate(base, token, path, page_size=page_size):
-        for ep in page:
-            yield ep
-
-
-def build_episode_lookup(episodes: list[dict]) -> dict[tuple[int, int], dict]:
-    lookup: dict[tuple[int, int], dict] = {}
-    for ep in episodes:
-        if not isinstance(ep, dict):
-            continue
-        s_num = ep.get("season_number") or ep.get("season") or ep.get("season_num") or 0
-        e_num = ep.get("episode_number") or ep.get("episode_num") or ep.get("num") or 0
-        try:
-            s_num = int(s_num)
-            e_num = int(e_num)
-        except Exception:
-            continue
-        if s_num and e_num:
-            lookup[(s_num, e_num)] = ep
-    return lookup
 
 
 def api_get_series_provider_info(base: str, token: str, series_id: int) -> dict:
@@ -1123,124 +1158,51 @@ def get_normalized_provider_info_with_fallback(
 # ------------------------------------------------------------
 # XC proxy URLs
 # ------------------------------------------------------------
-def _find_first_value(obj, keys: tuple[str, ...]):
+def build_vod_session_id(content_uuid: str, stream_id: int | str | None = None) -> str:
+    """Build a Dispatcharr VOD session id like the web UI uses: vod_<ms>_<suffix>."""
+    seed = f"{content_uuid}:{stream_id}:{time.time()}"
+    suffix = abs(hash(seed)) % 9000 + 1000
+    return f"vod_{int(time.time() * 1000)}_{suffix}"
+
+
+def build_movie_proxy_url(proxy_host: str, vod_uuid: str, stream_id: int | str | None) -> str:
     """
-    Recursively search dictionaries/lists for the first non-empty value matching
-    any of the supplied keys. This lets us pick up provider stream IDs even when
-    Dispatcharr stores them under custom_properties/provider metadata.
-    """
-    if isinstance(obj, dict):
-        for key in keys:
-            val = obj.get(key)
-            if val not in (None, ""):
-                return val
-        for val in obj.values():
-            found = _find_first_value(val, keys)
-            if found not in (None, ""):
-                return found
-    elif isinstance(obj, list):
-        for item in obj:
-            found = _find_first_value(item, keys)
-            if found not in (None, ""):
-                return found
-    return None
+    Build the Dispatcharr VOD movie proxy URL for STRM files.
 
-
-def get_movie_stream_id(movie: dict):
-    """Return the provider/XC stream_id used by Dispatcharr's VOD proxy."""
-    return _find_first_value(
-        movie,
-        (
-            "stream_id",
-            "streamId",
-            "provider_stream_id",
-            "providerStreamId",
-            "xc_stream_id",
-            "xcStreamId",
-        ),
-    )
-
-
-def build_vod_session_id(vod_uuid: str, stream_id) -> str:
-    """
-    Build a stable session id in the same shape Dispatcharr emits, e.g.
-    vod_1780577743930_3689. Keeping it stable prevents STRM contents from
-    changing every run.
-    """
-    seed = f"{vod_uuid}:{stream_id}".encode("utf-8", errors="ignore")
-    digest = hashlib.sha1(seed).hexdigest()
-    millis = 1700000000000 + (int(digest[:10], 16) % 999999999999)
-    suffix = int(digest[10:14], 16) % 10000
-    return f"vod_{millis}_{suffix:04d}"
-
-
-def build_movie_proxy_url(proxy_host: str, movie: dict) -> str:
-    """
-    For movies write Dispatcharr's documented VOD proxy URL to the STRM file.
-
-    The Swagger docs expose these supported forms:
-      /proxy/vod/{content_type}/{content_id}
-      /proxy/vod/{content_type}/{content_id}/{session_id}
-
-    The session_id shown by Dispatcharr's player URLs is generated by Dispatcharr.
-    Do not invent one in the STRM file; use the uuid-only VOD route and let
-    Dispatcharr create/reuse the session when playback starts.
+    Expected format:
+      <DISPATCHARR_BASE_URL>/proxy/vod/movie/<movie_uuid>/<session_id>?stream_id=<provider_stream_id>
     """
     proxy_host = proxy_host.rstrip("/")
-    vod_uuid = movie.get("uuid") or ""
-    if not vod_uuid:
-        raise ValueError(
-            f"Movie '{movie.get('name') or movie.get('id')}' has no uuid; "
-            f"cannot build Dispatcharr VOD URL"
-        )
-
-    stream_id = get_movie_stream_id(movie)
-    url = f"{proxy_host}/proxy/vod/movie/{vod_uuid}"
+    session_id = build_vod_session_id(vod_uuid, stream_id)
+    url = f"{proxy_host}/proxy/vod/movie/{vod_uuid}/{session_id}"
     if stream_id not in (None, ""):
         url += f"?stream_id={stream_id}"
     return url
 
 
-def get_episode_uuid(ep: dict):
-    """Return the Dispatcharr Episode UUID required by /proxy/vod/episode/."""
-    return _find_first_value(ep, ("uuid", "episode_uuid", "episodeUuid"))
-
-
-def get_episode_stream_id(ep: dict):
-    """Return the provider/XC stream_id when Dispatcharr exposes it."""
-    return _find_first_value(
-        ep,
-        (
-            "stream_id",
-            "streamId",
-            "provider_stream_id",
-            "providerStreamId",
-            "xc_stream_id",
-            "xcStreamId",
-        ),
-    )
-
-
-def build_series_episode_proxy_url(proxy_host: str, episode_obj: dict) -> str:
+def build_series_episode_proxy_url(
+    proxy_host: str,
+    episode_uuid: str,
+    stream_id: int | str | None,
+) -> str:
     """
-    For TV episodes write Dispatcharr's documented VOD episode proxy URL.
-
-    Use the Dispatcharr episode uuid as content_id. Like movies, do not invent
-    a session_id; Dispatcharr will generate it when the URL is opened.
+    Build the Dispatcharr VOD episode proxy URL for STRM files.
     """
     proxy_host = proxy_host.rstrip("/")
-    episode_uuid = get_episode_uuid(episode_obj)
-    if not episode_uuid:
-        raise ValueError(
-            f"Episode '{episode_obj.get('name') or episode_obj.get('title') or episode_obj.get('id')}' "
-            f"has no uuid; cannot build Dispatcharr episode VOD URL"
-        )
-
-    stream_id = get_episode_stream_id(episode_obj)
-    url = f"{proxy_host}/proxy/vod/episode/{episode_uuid}"
+    session_id = build_vod_session_id(episode_uuid, stream_id)
+    url = f"{proxy_host}/proxy/vod/episode/{episode_uuid}/{session_id}"
     if stream_id not in (None, ""):
         url += f"?stream_id={stream_id}"
     return url
+
+
+def build_series_episode_streamid_proxy_url(
+    proxy_host: str,
+    stream_id: int | str,
+) -> str:
+    proxy_host = proxy_host.rstrip("/")
+    session_id = build_vod_session_id(str(stream_id), stream_id)
+    return f"{proxy_host}/proxy/vod/episode/{stream_id}/{session_id}?stream_id={stream_id}"
 
 
 # ------------------------------------------------------------
@@ -1582,7 +1544,15 @@ def build_episode_nfo(
 # ------------------------------------------------------------
 # Per-movie / per-series export
 # ------------------------------------------------------------
-def export_movie(account_name: str, movies_dir: Path, proxy_host: str, account_id: int, movie: dict):
+def export_movie(
+    base: str,
+    token: str,
+    account_name: str,
+    movies_dir: Path,
+    proxy_host: str,
+    account_id: int,
+    movie: dict,
+):
     name = movie.get("name") or ""
     year = movie.get("year") or 0
     tmdb_id = movie.get("tmdb_id")
@@ -1600,7 +1570,14 @@ def export_movie(account_name: str, movies_dir: Path, proxy_host: str, account_i
     movie_dir = movies_dir / cat / title_fs
     strm_path = movie_dir / (title_fs + ".strm")
 
-    url = build_movie_proxy_url(proxy_host, movie)
+    vod_uuid = movie.get("uuid") or ""
+    stream_id = get_movie_stream_id(base, token, movie)
+    if not stream_id:
+        log(
+            f"WARNING: No provider stream_id found for movie '{name}' "
+            f"(movie id={movie.get('id')}, uuid={vod_uuid}). Writing URL without stream_id."
+        )
+    url = build_movie_proxy_url(proxy_host, vod_uuid, stream_id)
     write_strm(strm_path, url)
 
     if not ENABLE_NFO:
@@ -1691,24 +1668,6 @@ def export_series(
 
     series["_provider_info"] = provider_info
 
-    # Fetch Dispatcharr Episode objects once for this series so TV STRMs can use
-    # /proxy/vod/episode/<episode_uuid>/<session_id>?stream_id=<stream_id>.
-    # Provider-info/XC episode entries usually contain season/episode metadata,
-    # but the Dispatcharr Episode endpoint is the source of truth for episode UUIDs.
-    dispatcharr_episode_lookup: dict[tuple[int, int], dict] = {}
-    series_id = series.get("id")
-    if series_id:
-        try:
-            dispatcharr_episodes = list(get_episodes_for_series(base, token, series_id))
-            dispatcharr_episode_lookup = build_episode_lookup(dispatcharr_episodes)
-            if LOG_LEVEL in ("DEBUG", "VERBOSE"):
-                log(
-                    f"Loaded {len(dispatcharr_episode_lookup)} Dispatcharr episode UUID(s) "
-                    f"for series_id={series_id} ({account_name})."
-                )
-        except Exception as e:
-            log(f"WARNING: Could not load Dispatcharr episode UUIDs for series_id={series_id}: {e}")
-
     tv_tmdb_data = None
     if ENABLE_NFO:
         if tmdb_id:
@@ -1751,19 +1710,22 @@ def export_series(
             filename = f"S{s_num:02d}E{ep_num:02d} - {ep_title_clean}".strip(" -")
             strm_path = season_dir / f"{filename}.strm"
 
-            dispatcharr_ep = dispatcharr_episode_lookup.get((int(s_num), int(ep_num)), {})
-            episode_for_url = dict(ep)
-            if dispatcharr_ep:
-                # Preserve provider-info stream_id, but add Dispatcharr's episode UUID
-                # and other Episode fields from /api/vod/episodes/.
-                episode_for_url.update(dispatcharr_ep)
-                if ep.get("stream_id") not in (None, ""):
-                    episode_for_url["stream_id"] = ep.get("stream_id")
-
-            try:
-                url = build_series_episode_proxy_url(proxy_host, episode_for_url)
-            except ValueError as e:
-                log(f"WARNING: {e}; skipping STRM for {filename}")
+            episode_uuid = ep.get("uuid") or ep.get("episode_uuid") or ""
+            stream_id = ep.get("stream_id")
+            if not stream_id:
+                stream_id = _find_first_key_recursive(
+                    ep,
+                    {"stream_id", "streamid", "provider_stream_id", "providerstreamid"},
+                )
+            if episode_uuid:
+                url = build_series_episode_proxy_url(proxy_host, episode_uuid, stream_id)
+            elif stream_id:
+                url = build_series_episode_streamid_proxy_url(proxy_host, stream_id)
+            else:
+                log(
+                    f"WARNING: No episode uuid or stream_id for series '{name}' "
+                    f"S{s_num:02d}E{ep_num:02d}; skipping STRM."
+                )
                 continue
             write_strm(strm_path, url)
 
@@ -1825,7 +1787,7 @@ def export_movies_for_account(base: str, token: str, account: dict):
 
     for movie in movies:
         processed += 1
-        export_movie(account_name, movies_dir, proxy_host, account_id, movie)
+        export_movie(base, token, account_name, movies_dir, proxy_host, account_id, movie)
         name = movie.get("name") or ""
         year = movie.get("year") or 0
         clean_title = movie.get("clean_title") or normalize_title(name)
