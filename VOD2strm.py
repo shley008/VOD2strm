@@ -136,7 +136,7 @@ def build_config() -> Config:
         test_limit_series=as_int("TEST_LIMIT_SERIES", 20) or 20,
         page_size=as_int("PAGE_SIZE", 250) or 250,
         log_level=setting("LOG_LEVEL", "INFO").strip().upper(),
-        user_agent=setting("HTTP_USER_AGENT", "VOD2strm/1.3"),
+        user_agent=setting("HTTP_USER_AGENT", "VOD2strm/1.4"),
     )
 
 
@@ -214,10 +214,11 @@ def api_get(path: str, token: str | None = None, params: dict[str, Any] | None =
         return r.text
 
 
-def get_list(path: str, token: str | None) -> tuple[list[dict[str, Any]], bool]:
+def get_list(path: str, token: str | None, label: str) -> tuple[list[dict[str, Any]], bool]:
     out: list[dict[str, Any]] = []
     page = 1
     while True:
+        progress(f"Fetching {label} catalog page {page}...")
         data = api_get(path, token, {"page": page, "page_size": CFG.page_size})
         if data is None:
             return out, False
@@ -225,13 +226,18 @@ def get_list(path: str, token: str | None) -> tuple[list[dict[str, Any]], bool]:
             items = data.get("results") or data.get("data") or data.get("items") or []
             has_next = bool(data.get("next"))
         elif isinstance(data, list):
-            items = data
-            has_next = len(items) >= CFG.page_size
+            # Some Dispatcharr endpoints return a complete plain list and ignore page/page_size.
+            # Treat that as a complete single-page response; otherwise this can loop forever.
+            out.extend(x for x in data if isinstance(x, dict))
+            progress(f"Fetched {len(out)} {label} catalog items from single list response.")
+            return out, True
         else:
             return out, False
         if not items:
+            progress(f"Fetched {len(out)} {label} catalog items total.")
             return out, True
         out.extend(x for x in items if isinstance(x, dict))
+        progress(f"Fetched {len(out)} {label} catalog items so far.")
         if not has_next:
             return out, True
         page += 1
@@ -408,9 +414,13 @@ def export_movies(token: str | None, account: dict[str, Any]) -> None:
     movies = load_cache(cfile)
     ok = True
     if movies is None:
-        movies, ok = get_list(f"/api/vod/movies/?m3u_account={aid}", token)
+        log(f"Fetching movie catalog for {aname}...")
+        movies, ok = get_list(f"/api/vod/movies/?m3u_account={aid}", token, "movie")
+        log(f"Movie catalog for {aname}: {len(movies)} items; complete={ok}")
         if ok:
             save_cache(cfile, movies)
+    else:
+        log(f"Using cached movie catalog for {aname}: {len(movies)} items")
     if CFG.test_mode:
         movies = movies[: CFG.test_limit_movies]
         log(f"TEST_MODE=true: movies limited to {len(movies)} and cleanup disabled")
@@ -487,9 +497,13 @@ def export_series(token: str | None, account: dict[str, Any]) -> None:
     shows = load_cache(cfile)
     ok = True
     if shows is None:
-        shows, ok = get_list(f"/api/vod/series/?m3u_account={aid}", token)
+        log(f"Fetching series catalog for {aname}...")
+        shows, ok = get_list(f"/api/vod/series/?m3u_account={aid}", token, "series")
+        log(f"Series catalog for {aname}: {len(shows)} items; complete={ok}")
         if ok:
             save_cache(cfile, shows)
+    else:
+        log(f"Using cached series catalog for {aname}: {len(shows)} items")
     if CFG.test_mode:
         shows = shows[: CFG.test_limit_series]
         log(f"TEST_MODE=true: series limited to {len(shows)} and cleanup disabled")
