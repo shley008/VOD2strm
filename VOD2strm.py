@@ -1,18 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""Incremental Dispatcharr VOD -> STRM exporter.
+
+Safety rules:
+- Normal mode always reads the full Dispatcharr catalog; LIMIT_MOVIES/LIMIT_SERIES are ignored.
+- TEST_MODE may limit processing, but stale deletion is automatically disabled.
+- Stale cleanup only runs after successful catalog fetches and never when expected files are empty.
+- The Movies/Series root directories are never removed.
 """
-VOD2strm - Dispatcharr VOD to STRM exporter.
-
-This version is intentionally incremental:
-- It never removes the whole Movies or Series library directory.
-- It only writes STRM files whose content changed.
-- It deletes stale STRM files that no longer exist in Dispatcharr when DELETE_OLD=true.
-- It can run in fast STRM-only mode by leaving ENABLE_NFO=false.
-
-Required config may be provided in VOD2strm_vars.sh or environment variables.
-Environment variables override the vars file.
-"""
-
 from __future__ import annotations
 
 import fnmatch
@@ -24,32 +19,30 @@ import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 from urllib.parse import urlencode
 
 import requests
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 VARS_FILE = SCRIPT_DIR / "VOD2strm_vars.sh"
+API_ERRORS = 0
+_CURRENT_TOKEN: str | None = None
 
 
-# -----------------------------------------------------------------------------
-# Config
-# -----------------------------------------------------------------------------
 def load_vars(path: Path) -> dict[str, str]:
-    values: dict[str, str] = {}
+    out: dict[str, str] = {}
     if not path.exists():
-        return values
-
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
+        return out
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         if line.startswith("export "):
-            line = line[len("export ") :].strip()
-        key, value = line.split("=", 1)
-        values[key.strip()] = value.strip().strip('"').strip("'")
-    return values
+            line = line[7:].strip()
+        key, val = line.split("=", 1)
+        out[key.strip()] = val.strip().strip('"').strip("'")
+    return out
 
 
 VARS = load_vars(VARS_FILE)
@@ -57,592 +50,479 @@ VARS = load_vars(VARS_FILE)
 
 def setting(name: str, default: str = "", *aliases: str) -> str:
     for key in (name, *aliases):
-        if os.getenv(key) is not None:
-            return os.getenv(key, "")
+        val = os.getenv(key)
+        if val is not None:
+            return val
         if key in VARS:
             return VARS[key]
     return default
 
 
-def bool_setting(name: str, default: bool = False, *aliases: str) -> bool:
-    raw_default = "true" if default else "false"
-    return setting(name, raw_default, *aliases).strip().lower() in {"1", "true", "yes", "on"}
+def as_bool(name: str, default: bool = False, *aliases: str) -> bool:
+    raw = setting(name, "true" if default else "false", *aliases).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def as_int(name: str, default: int | None = None, *aliases: str) -> int | None:
+    raw = setting(name, "" if default is None else str(default), *aliases).strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def safe_path(name: str, default: Path, *aliases: str) -> Path:
+    raw = setting(name, str(default), *aliases).strip()
+    if not raw or raw in {".", "./"}:
+        return default
+    return Path(raw)
 
 
 @dataclass(frozen=True)
 class Config:
     dispatcharr_url: str
-    dispatcharr_api_key: str
-    dispatcharr_api_user: str
-    dispatcharr_api_pass: str
-    movies_dir_template: str
-    series_dir_template: str
+    api_key: str
+    api_user: str
+    api_pass: str
+    movies_dir: str
+    series_dir: str
     cache_dir: Path
     log_file: Path
-    xc_names: list[str]
+    account_filters: list[str]
     export_movies: bool
     export_series: bool
     delete_old: bool
     clear_cache: bool
     dry_run: bool
-    enable_nfo: bool
-    overwrite_nfo: bool
-    log_level: str
+    test_mode: bool
+    test_limit_movies: int
+    test_limit_series: int
     page_size: int
-    limit_movies: int | None
-    limit_series: int | None
+    log_level: str
     user_agent: str
 
 
-def optional_int(value: str) -> int | None:
-    value = (value or "").strip()
-    if not value:
-        return None
-    try:
-        return int(value)
-    except ValueError:
-        return None
-
-
 def build_config() -> Config:
-    # New preferred names are DISPATCHARR_URL, DISPATCHARR_API_KEY, MOVIES_DIR, SERIES_DIR.
-    # Old names are still accepted for compatibility.
-    dispatcharr_url = setting("DISPATCHARR_URL", "http://127.0.0.1:9191", "DISPATCHARR_BASE_URL").strip().rstrip("/")
-    if not dispatcharr_url.startswith(("http://", "https://")):
-        dispatcharr_url = "http://" + dispatcharr_url
-
-    xc_names_raw = setting("XC_NAMES", "*", "ACCOUNT_FILTERS")
-    xc_names = [item.strip() for item in xc_names_raw.split(",") if item.strip()] or ["*"]
-
+    url = setting("DISPATCHARR_URL", "http://127.0.0.1:9191", "DISPATCHARR_BASE_URL").strip().rstrip("/")
+    if url and not url.startswith(("http://", "https://")):
+        url = "http://" + url
+    filters_raw = setting("XC_NAMES", "*", "ACCOUNT_FILTERS")
+    filters = [x.strip() for x in filters_raw.split(",") if x.strip()] or ["*"]
+    test_mode = as_bool("TEST_MODE", False)
+    delete_old = as_bool("DELETE_OLD", True) and not test_mode
     return Config(
-        dispatcharr_url=dispatcharr_url,
-        dispatcharr_api_key=setting("DISPATCHARR_API_KEY", "", "API_TOKEN", "DISPATCHARR_API_TOKEN").strip(),
-        dispatcharr_api_user=setting("DISPATCHARR_API_USER", "admin", "DISPATCHARR_USER").strip(),
-        dispatcharr_api_pass=setting("DISPATCHARR_API_PASS", "", "DISPATCHARR_PASS").strip(),
-        movies_dir_template=setting("MOVIES_DIR", "/mnt/Share-VOD/{XC_NAME}/Movies", "MOVIES_LIBRARY_PATH"),
-        series_dir_template=setting("SERIES_DIR", "/mnt/Share-VOD/{XC_NAME}/Series", "TV_LIBRARY_PATH", "SERIES_LIBRARY_PATH"),
-        cache_dir=Path(setting("CACHE_DIR", str(SCRIPT_DIR / "cache"))),
-        log_file=Path(setting("LOG_FILE", str(SCRIPT_DIR / "VOD2strm.log"))),
-        xc_names=xc_names,
-        export_movies=bool_setting("EXPORT_MOVIES", True),
-        export_series=bool_setting("EXPORT_SERIES", True),
-        delete_old=bool_setting("DELETE_OLD", True),
-        clear_cache=bool_setting("CLEAR_CACHE", False),
-        dry_run=bool_setting("DRY_RUN", False),
-        enable_nfo=bool_setting("ENABLE_NFO", False),
-        overwrite_nfo=bool_setting("OVERWRITE_NFO", False),
+        dispatcharr_url=url,
+        api_key=setting("DISPATCHARR_API_KEY", "", "API_TOKEN", "DISPATCHARR_API_TOKEN").strip(),
+        api_user=setting("DISPATCHARR_API_USER", "admin", "DISPATCHARR_USER").strip(),
+        api_pass=setting("DISPATCHARR_API_PASS", "", "DISPATCHARR_PASS").strip(),
+        movies_dir=setting("MOVIES_DIR", "/mnt/Share-VOD/{XC_NAME}/Movies", "MOVIES_LIBRARY_PATH"),
+        series_dir=setting("SERIES_DIR", "/mnt/Share-VOD/{XC_NAME}/Series", "TV_LIBRARY_PATH", "SERIES_LIBRARY_PATH"),
+        cache_dir=safe_path("CACHE_DIR", SCRIPT_DIR / "cache"),
+        log_file=safe_path("LOG_FILE", SCRIPT_DIR / "VOD2strm.log"),
+        account_filters=filters,
+        export_movies=as_bool("EXPORT_MOVIES", True),
+        export_series=as_bool("EXPORT_SERIES", True),
+        delete_old=delete_old,
+        clear_cache=as_bool("CLEAR_CACHE", False),
+        dry_run=as_bool("DRY_RUN", False),
+        test_mode=test_mode,
+        test_limit_movies=as_int("TEST_LIMIT_MOVIES", 20) or 20,
+        test_limit_series=as_int("TEST_LIMIT_SERIES", 20) or 20,
+        page_size=as_int("PAGE_SIZE", 250) or 250,
         log_level=setting("LOG_LEVEL", "INFO").strip().upper(),
-        page_size=optional_int(setting("PAGE_SIZE", "250")) or 250,
-        limit_movies=optional_int(setting("LIMIT_MOVIES", "")),
-        limit_series=optional_int(setting("LIMIT_SERIES", "")),
-        user_agent=setting("HTTP_USER_AGENT", "VOD2strm/1.1"),
+        user_agent=setting("HTTP_USER_AGENT", "VOD2strm/1.2"),
     )
 
 
-CONFIG = build_config()
-_CURRENT_TOKEN: str | None = None
+CFG = build_config()
 
 
-# -----------------------------------------------------------------------------
-# Logging
-# -----------------------------------------------------------------------------
-def log(message: str) -> None:
-    line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}"
+def log(msg: str) -> None:
+    line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
     print(line)
-    CONFIG.log_file.parent.mkdir(parents=True, exist_ok=True)
-    with CONFIG.log_file.open("a", encoding="utf-8") as handle:
-        handle.write(line + "\n")
-
-
-def debug(message: str) -> None:
-    if CONFIG.log_level in {"DEBUG", "VERBOSE"}:
-        log(message)
-
-
-def progress(message: str) -> None:
-    if CONFIG.log_level in {"DEBUG", "VERBOSE", "INFO"}:
-        log(message)
-
-
-# -----------------------------------------------------------------------------
-# Generic helpers
-# -----------------------------------------------------------------------------
-TAG_PATTERN = re.compile(r"(\b(4K|8K|1080p|720p|HDR10|HDR|H.264|H\.265|HEVC)\b|\[[^\]]+\])", re.IGNORECASE)
-FS_SAFE_PATTERN = re.compile(r'[\\/:*?"<>|]+')
-UUID_PATTERN = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
-
-
-def normalize_title(title: str) -> str:
-    title = unicodedata.normalize("NFKC", title or "")
-    title = TAG_PATTERN.sub("", title)
-    title = re.sub(r"\s+", " ", title).strip(" -._")
-    return title or "Untitled"
-
-
-def fs_safe(name: str) -> str:
-    cleaned = FS_SAFE_PATTERN.sub("_", (name or "").strip()).strip(" .")
-    return cleaned or "_"
-
-
-def account_matches(name: str) -> bool:
-    return any(fnmatch.fnmatch(name or "", pattern) for pattern in CONFIG.xc_names)
-
-
-def mkdir(path: Path) -> None:
-    if CONFIG.dry_run:
-        debug(f"[dry-run] Would create directory: {path}")
-        return
-    path.mkdir(parents=True, exist_ok=True)
-
-
-def write_text_if_changed(path: Path, content: str) -> str:
-    """Return added, updated, unchanged, or dry-run."""
-    old = None
-    if path.exists():
-        try:
-            old = path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            old = None
-    if old == content:
-        return "unchanged"
-
-    if CONFIG.dry_run:
-        log(f"[dry-run] Would {'update' if path.exists() else 'create'}: {path}")
-        return "dry-run"
-
-    mkdir(path.parent)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(content, encoding="utf-8")
-    os.replace(tmp, path)
-    return "updated" if old is not None else "added"
-
-
-def remove_empty_dirs(root: Path) -> int:
-    if not root.exists():
-        return 0
-    removed = 0
-    for directory in sorted((p for p in root.glob("**/*") if p.is_dir()), key=lambda p: len(p.parts), reverse=True):
-        try:
-            if CONFIG.dry_run:
-                debug(f"[dry-run] Would remove empty directory: {directory}")
-            else:
-                directory.rmdir()
-            removed += 1
-        except OSError:
-            pass
-    return removed
-
-
-def find_first_key(obj: Any, keys: set[str]) -> Any:
-    if isinstance(obj, dict):
-        for key, value in obj.items():
-            if str(key).lower() in keys and value not in (None, ""):
-                return value
-        for value in obj.values():
-            found = find_first_key(value, keys)
-            if found not in (None, ""):
-                return found
-    elif isinstance(obj, list):
-        for item in obj:
-            found = find_first_key(item, keys)
-            if found not in (None, ""):
-                return found
-    return None
-
-
-def find_uuid(obj: Any, preferred_keys: set[str]) -> str | None:
-    found = find_first_key(obj, preferred_keys)
-    if found:
-        return str(found)
-
-    # Last-resort recursive UUID search.
-    if isinstance(obj, dict):
-        for value in obj.values():
-            result = find_uuid(value, preferred_keys)
-            if result:
-                return result
-    elif isinstance(obj, list):
-        for item in obj:
-            result = find_uuid(item, preferred_keys)
-            if result:
-                return result
-    elif isinstance(obj, str) and UUID_PATTERN.match(obj):
-        return obj
-    return None
-
-
-def cache_path(account_name: str, name: str) -> Path:
-    return CONFIG.cache_dir / fs_safe(account_name) / name
-
-
-def load_json(path: Path) -> Any | None:
-    if not path.exists():
-        return None
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        log(f"Failed reading cache {path}: {exc}")
-        return None
-
-
-def save_json(path: Path, data: Any) -> None:
-    if CONFIG.dry_run:
-        debug(f"[dry-run] Would write cache: {path}")
-        return
+    path = CFG.log_file if not (CFG.log_file.exists() and CFG.log_file.is_dir()) else SCRIPT_DIR / "VOD2strm.log"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    with path.open("a", encoding="utf-8") as f:
+        f.write(line + "\n")
 
 
-# -----------------------------------------------------------------------------
-# Dispatcharr API
-# -----------------------------------------------------------------------------
+def progress(msg: str) -> None:
+    if CFG.log_level in {"INFO", "DEBUG", "VERBOSE"}:
+        log(msg)
+
+
+def debug(msg: str) -> None:
+    if CFG.log_level in {"DEBUG", "VERBOSE"}:
+        log(msg)
+
+
 def headers(token: str | None = None) -> dict[str, str]:
-    result = {"Accept": "application/json", "User-Agent": CONFIG.user_agent}
-    auth_token = token or CONFIG.dispatcharr_api_key
-    if auth_token:
-        result["Authorization"] = f"Bearer {auth_token}"
-    return result
+    h = {"Accept": "application/json", "User-Agent": CFG.user_agent}
+    tok = token or CFG.api_key
+    if tok:
+        h["Authorization"] = f"Bearer {tok}"
+    return h
 
 
 def api_login() -> str | None:
-    if CONFIG.dispatcharr_api_key:
-        return CONFIG.dispatcharr_api_key
-    if not CONFIG.dispatcharr_api_user or not CONFIG.dispatcharr_api_pass:
+    if CFG.api_key:
+        return CFG.api_key
+    if not (CFG.api_user and CFG.api_pass):
         return None
-
-    url = f"{CONFIG.dispatcharr_url}/api/accounts/token/"
-    response = requests.post(
-        url,
-        json={"username": CONFIG.dispatcharr_api_user, "password": CONFIG.dispatcharr_api_pass},
-        headers={"User-Agent": CONFIG.user_agent},
+    r = requests.post(
+        f"{CFG.dispatcharr_url}/api/accounts/token/",
+        json={"username": CFG.api_user, "password": CFG.api_pass},
+        headers={"User-Agent": CFG.user_agent},
         timeout=30,
     )
-    if response.status_code != 200:
-        raise RuntimeError(f"Dispatcharr login failed ({response.status_code}): {response.text[:250]}")
-    token = response.json().get("access")
+    if r.status_code != 200:
+        raise RuntimeError(f"Dispatcharr login failed ({r.status_code}): {r.text[:250]}")
+    token = r.json().get("access")
     if not token:
-        raise RuntimeError("Dispatcharr login succeeded but response did not include an access token")
+        raise RuntimeError("Dispatcharr login returned no access token")
     return token
 
 
 def api_get(path: str, token: str | None = None, params: dict[str, Any] | None = None) -> Any | None:
-    global _CURRENT_TOKEN
-
-    url = f"{CONFIG.dispatcharr_url}{path}"
-    response = requests.get(url, headers=headers(_CURRENT_TOKEN or token), params=params or {}, timeout=60)
-
-    if response.status_code == 401 and not CONFIG.dispatcharr_api_key:
-        log("WARNING: Dispatcharr returned 401; trying one re-login.")
-        _CURRENT_TOKEN = api_login()
-        response = requests.get(url, headers=headers(_CURRENT_TOKEN), params=params or {}, timeout=60)
-
-    if not response.ok:
-        log(f"HTTP {response.status_code} from {url}: {response.text[:250]}")
+    global _CURRENT_TOKEN, API_ERRORS
+    url = f"{CFG.dispatcharr_url}{path}"
+    try:
+        r = requests.get(url, headers=headers(_CURRENT_TOKEN or token), params=params or {}, timeout=60)
+        if r.status_code == 401 and not CFG.api_key:
+            log("WARNING: Dispatcharr returned 401; retrying once after login")
+            _CURRENT_TOKEN = api_login()
+            r = requests.get(url, headers=headers(_CURRENT_TOKEN), params=params or {}, timeout=60)
+    except requests.RequestException as exc:
+        API_ERRORS += 1
+        log(f"API request failed: {url}: {exc}")
         return None
-    if not response.content:
+    if not r.ok:
+        API_ERRORS += 1
+        log(f"HTTP {r.status_code} from {url}: {r.text[:250]}")
+        return None
+    if not r.content:
         return None
     try:
-        return response.json()
+        return r.json()
     except ValueError:
-        return response.text
+        return r.text
 
 
-def paginate(path: str, token: str | None, page_size: int, limit: int | None = None) -> Iterable[dict[str, Any]]:
-    seen = 0
+def get_list(path: str, token: str | None) -> tuple[list[dict[str, Any]], bool]:
+    out: list[dict[str, Any]] = []
     page = 1
     while True:
-        if limit is not None and seen >= limit:
-            return
-        params = {"page": page, "page_size": page_size}
-        data = api_get(path, token, params)
+        data = api_get(path, token, {"page": page, "page_size": CFG.page_size})
         if data is None:
-            return
-
+            return out, False
         if isinstance(data, dict):
             items = data.get("results") or data.get("data") or data.get("items") or []
             has_next = bool(data.get("next"))
         elif isinstance(data, list):
             items = data
-            has_next = len(items) >= page_size
+            has_next = len(items) >= CFG.page_size
         else:
-            return
-
+            return out, False
         if not items:
-            return
-        for item in items:
-            if limit is not None and seen >= limit:
-                return
-            if isinstance(item, dict):
-                yield item
-                seen += 1
+            return out, True
+        out.extend(x for x in items if isinstance(x, dict))
         if not has_next:
-            return
+            return out, True
         page += 1
 
 
-def get_accounts(token: str | None) -> list[dict[str, Any]]:
+def get_accounts(token: str | None) -> tuple[list[dict[str, Any]], bool]:
     data = api_get("/api/m3u/accounts/", token)
     if isinstance(data, list):
-        return data
+        return data, True
     if isinstance(data, dict):
-        return data.get("results") or data.get("data") or data.get("items") or []
-    return []
+        return data.get("results") or data.get("data") or data.get("items") or [], True
+    return [], False
 
 
-def get_movie_provider_info(movie_id: Any, token: str | None) -> dict[str, Any]:
-    if not movie_id:
+def get_provider(kind: str, item_id: Any, token: str | None) -> dict[str, Any]:
+    if not item_id:
         return {}
-    data = api_get(f"/api/vod/movies/{movie_id}/provider-info/", token)
+    if kind == "movie":
+        data = api_get(f"/api/vod/movies/{item_id}/provider-info/", token)
+    else:
+        data = api_get(f"/api/vod/series/{item_id}/provider-info/", token, {"include_episodes": "true"})
     return data if isinstance(data, dict) else {}
 
 
-def get_series_provider_info(series_id: Any, token: str | None) -> dict[str, Any]:
-    if not series_id:
-        return {}
-    data = api_get(f"/api/vod/series/{series_id}/provider-info/", token, {"include_episodes": "true"})
-    return data if isinstance(data, dict) else {}
+TAG_RE = re.compile(r"(\b(4K|8K|1080p|720p|HDR10|HDR|H.264|H\.265|HEVC)\b|\[[^\]]+\])", re.I)
+BAD_FS_RE = re.compile(r'[\\/:*?"<>|]+')
+UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
 
-# -----------------------------------------------------------------------------
-# STRM URL builders - required formats
-# -----------------------------------------------------------------------------
-def movie_strm_url(movie_uuid: str, stream_id: Any) -> str:
-    query = urlencode({"stream_id": stream_id})
-    return f"{CONFIG.dispatcharr_url}/proxy/vod/movie/{movie_uuid}?{query}"
+def clean_title(s: str) -> str:
+    s = unicodedata.normalize("NFKC", s or "")
+    s = TAG_RE.sub("", s)
+    s = re.sub(r"\s+", " ", s).strip(" -._")
+    return s or "Untitled"
 
 
-def episode_strm_url(episode_uuid: str, account_id: Any) -> str:
-    query = urlencode({"m3u_account_id": account_id})
-    return f"{CONFIG.dispatcharr_url}/proxy/vod/episode/{episode_uuid}?{query}"
+def fs_safe(s: str) -> str:
+    return BAD_FS_RE.sub("_", (s or "").strip()).strip(" .") or "_"
 
 
-# -----------------------------------------------------------------------------
-# Normalization
-# -----------------------------------------------------------------------------
-def movie_identity(movie: dict[str, Any], provider: dict[str, Any]) -> tuple[str | None, Any | None]:
-    merged = {"movie": movie, "provider": provider}
-    uuid = find_uuid(merged, {"uuid", "movie_uuid", "vod_uuid", "content_uuid"})
-    stream_id = find_first_key(merged, {"stream_id", "streamid", "provider_stream_id", "providerstreamid"})
-    return uuid, stream_id
+def first_key(obj: Any, keys: set[str]) -> Any:
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if str(k).lower() in keys and v not in (None, ""):
+                return v
+        for v in obj.values():
+            x = first_key(v, keys)
+            if x not in (None, ""):
+                return x
+    elif isinstance(obj, list):
+        for v in obj:
+            x = first_key(v, keys)
+            if x not in (None, ""):
+                return x
+    return None
 
 
-def iter_normalized_episodes(provider: dict[str, Any]) -> Iterable[tuple[int, int, str, str]]:
-    """Yield season, episode, title, episode_uuid."""
-    episodes_obj = provider.get("episodes")
-
-    if isinstance(episodes_obj, dict):
-        for season_key, episodes in episodes_obj.items():
-            try:
-                season_num = int(season_key)
-            except Exception:
-                season_num = 1
-            if isinstance(episodes, list):
-                for episode in episodes:
-                    normalized = normalize_episode(episode, season_num)
-                    if normalized:
-                        yield normalized
-        return
-
-    if isinstance(episodes_obj, list):
-        for episode in episodes_obj:
-            normalized = normalize_episode(episode, None)
-            if normalized:
-                yield normalized
-        return
-
-    seasons_obj = provider.get("seasons") or provider.get("Seasons") or []
-    if isinstance(seasons_obj, list):
-        for season in seasons_obj:
-            if not isinstance(season, dict):
-                continue
-            season_num = as_int(season.get("number") or season.get("season_number") or season.get("season"), 1)
-            for episode in season.get("episodes") or season.get("Episodes") or []:
-                normalized = normalize_episode(episode, season_num)
-                if normalized:
-                    yield normalized
+def find_uuid(obj: Any, keys: set[str]) -> str | None:
+    x = first_key(obj, keys)
+    if x:
+        return str(x)
+    if isinstance(obj, dict):
+        for v in obj.values():
+            y = find_uuid(v, keys)
+            if y:
+                return y
+    elif isinstance(obj, list):
+        for v in obj:
+            y = find_uuid(v, keys)
+            if y:
+                return y
+    elif isinstance(obj, str) and UUID_RE.match(obj):
+        return obj
+    return None
 
 
-def normalize_episode(episode: Any, fallback_season: int | None) -> tuple[int, int, str, str] | None:
-    if not isinstance(episode, dict):
-        return None
-    season_num = as_int(
-        episode.get("season_number") or episode.get("season") or episode.get("season_num") or fallback_season,
-        1,
-    )
-    episode_num = as_int(
-        episode.get("episode_number") or episode.get("episode_num") or episode.get("num") or episode.get("episode"),
-        0,
-    )
-    if episode_num <= 0:
-        return None
-    title = episode.get("title") or episode.get("name") or episode.get("episode_name") or f"Episode {episode_num}"
-    uuid = find_uuid(episode, {"uuid", "episode_uuid", "content_uuid"})
-    if not uuid:
-        debug(f"Skipping S{season_num:02d}E{episode_num:02d}; no episode UUID found in provider-info")
-        return None
-    return season_num, episode_num, normalize_title(str(title)), uuid
-
-
-def as_int(value: Any, default: int) -> int:
-    try:
-        return int(value)
-    except Exception:
-        return default
-
-
-def category_for(item: dict[str, Any]) -> str:
+def item_category(item: dict[str, Any]) -> str:
     return fs_safe(str(item.get("genre") or item.get("category_name") or "Unsorted"))
 
 
-# -----------------------------------------------------------------------------
-# Exporters
-# -----------------------------------------------------------------------------
-def export_movies_for_account(token: str | None, account: dict[str, Any]) -> None:
-    if not CONFIG.export_movies:
-        log("EXPORT_MOVIES=false: skipping movies")
-        return
-
-    account_id = account.get("id")
-    account_name = account.get("name") or f"Account-{account_id}"
-    root = Path(CONFIG.movies_dir_template.replace("{XC_NAME}", str(account_name)))
-    mkdir(root)
-    log(f"=== Movies: {account_name} -> {root} ===")
-
-    movies_cache = cache_path(str(account_name), "movies.json")
-    movies = None if CONFIG.clear_cache else load_json(movies_cache)
-    if movies is None:
-        movies = list(paginate(f"/api/vod/movies/?m3u_account={account_id}", token, CONFIG.page_size, CONFIG.limit_movies))
-        save_json(movies_cache, movies)
-    log(f"Movies found for {account_name}: {len(movies)}")
-
-    expected: set[Path] = set()
-    stats = {"added": 0, "updated": 0, "unchanged": 0, "skipped": 0}
-
-    for index, movie in enumerate(movies, start=1):
-        provider = get_movie_provider_info(movie.get("id"), token)
-        movie_uuid, stream_id = movie_identity(movie, provider)
-        if not movie_uuid or stream_id in (None, ""):
-            stats["skipped"] += 1
-            log(f"WARNING: Skipping movie without UUID/stream_id: {movie.get('name') or movie.get('title') or movie.get('id')}")
-            continue
-
-        title = normalize_title(str(movie.get("name") or movie.get("title") or "Untitled"))
-        year = movie.get("year") or provider.get("year") or ""
-        folder_name = fs_safe(f"{title} ({year})" if year else title)
-        movie_dir = root / category_for(movie) / folder_name
-        strm_path = movie_dir / f"{folder_name}.strm"
-        expected.add(strm_path)
-
-        result = write_text_if_changed(strm_path, movie_strm_url(movie_uuid, stream_id) + "\n")
-        if result in stats:
-            stats[result] += 1
-
-        if index == 1 or index == len(movies) or index % 250 == 0:
-            progress(f"Movies {account_name}: {index}/{len(movies)} processed")
-
-    removed = cleanup_stale_strms(root, expected, "movie")
-    log(f"Movies summary for {account_name}: {stats['added']} added, {stats['updated']} updated, {stats['unchanged']} unchanged, {removed} removed, {stats['skipped']} skipped")
+def write_if_changed(path: Path, text: str) -> str:
+    old = None
+    if path.exists():
+        try:
+            old = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            pass
+    if old == text:
+        return "unchanged"
+    if CFG.dry_run:
+        log(f"[dry-run] Would {'update' if path.exists() else 'create'}: {path}")
+        return "dry-run"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+    return "updated" if old is not None else "added"
 
 
-def export_series_for_account(token: str | None, account: dict[str, Any]) -> None:
-    if not CONFIG.export_series:
-        log("EXPORT_SERIES=false: skipping series")
-        return
-
-    account_id = account.get("id")
-    account_name = account.get("name") or f"Account-{account_id}"
-    root = Path(CONFIG.series_dir_template.replace("{XC_NAME}", str(account_name)))
-    mkdir(root)
-    log(f"=== Series: {account_name} -> {root} ===")
-
-    series_cache = cache_path(str(account_name), "series.json")
-    series_list = None if CONFIG.clear_cache else load_json(series_cache)
-    if series_list is None:
-        series_list = list(paginate(f"/api/vod/series/?m3u_account={account_id}", token, CONFIG.page_size, CONFIG.limit_series))
-        save_json(series_cache, series_list)
-    log(f"Series found for {account_name}: {len(series_list)}")
-
-    expected: set[Path] = set()
-    stats = {"added": 0, "updated": 0, "unchanged": 0, "skipped": 0}
-
-    for index, series in enumerate(series_list, start=1):
-        provider = get_series_provider_info(series.get("id"), token)
-        title = normalize_title(str(series.get("name") or series.get("title") or "Untitled"))
-        show_dir = root / category_for(series) / fs_safe(title)
-
-        episode_count = 0
-        for season_num, episode_num, ep_title, ep_uuid in iter_normalized_episodes(provider):
-            episode_count += 1
-            season_dir = show_dir / f"Season {season_num:02d}"
-            base_name = fs_safe(f"S{season_num:02d}E{episode_num:02d} - {ep_title}")
-            strm_path = season_dir / f"{base_name}.strm"
-            expected.add(strm_path)
-            result = write_text_if_changed(strm_path, episode_strm_url(ep_uuid, account_id) + "\n")
-            if result in stats:
-                stats[result] += 1
-
-        if episode_count == 0:
-            stats["skipped"] += 1
-            debug(f"No usable episodes found for series: {title}")
-
-        if index == 1 or index == len(series_list) or index % 100 == 0:
-            progress(f"Series {account_name}: {index}/{len(series_list)} processed")
-
-    removed = cleanup_stale_strms(root, expected, "series")
-    log(f"Series summary for {account_name}: {stats['added']} added, {stats['updated']} updated, {stats['unchanged']} unchanged, {removed} removed, {stats['skipped']} skipped")
+def remove_empty_dirs(root: Path) -> None:
+    for d in sorted((p for p in root.glob("**/*") if p.is_dir()), key=lambda p: len(p.parts), reverse=True):
+        try:
+            if not CFG.dry_run:
+                d.rmdir()
+        except OSError:
+            pass
 
 
-def cleanup_stale_strms(root: Path, expected: set[Path], label: str) -> int:
-    if not CONFIG.delete_old or not root.exists():
+def cleanup(root: Path, expected: set[Path], label: str, catalog_ok: bool) -> int:
+    if not CFG.delete_old:
+        debug(f"Skipping stale cleanup for {label}: DELETE_OLD=false or TEST_MODE=true")
         return 0
-
+    if CFG.test_mode or not catalog_ok or API_ERRORS or not expected:
+        log(f"WARNING: Refusing stale cleanup for {label}; test/catalog/API/expected safety check failed")
+        return 0
     removed = 0
-    for existing in root.glob("**/*.strm"):
-        if existing not in expected:
-            if CONFIG.dry_run:
-                log(f"[dry-run] Would delete stale {label} STRM: {existing}")
+    for path in root.glob("**/*.strm") if root.exists() else []:
+        if path not in expected:
+            if CFG.dry_run:
+                log(f"[dry-run] Would delete stale {label} STRM: {path}")
             else:
-                existing.unlink()
+                path.unlink()
             removed += 1
-    empty_dirs = remove_empty_dirs(root)
-    debug(f"Removed {empty_dirs} empty directories under {root}")
+    remove_empty_dirs(root)
     return removed
 
 
-# -----------------------------------------------------------------------------
-# Main
-# -----------------------------------------------------------------------------
+def cache_file(account: str, name: str) -> Path:
+    return CFG.cache_dir / fs_safe(account) / name
+
+
+def load_cache(path: Path) -> Any | None:
+    if not path.exists() or CFG.clear_cache or CFG.test_mode:
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def save_cache(path: Path, data: Any) -> None:
+    if CFG.dry_run or CFG.test_mode:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+
+def export_movies(token: str | None, account: dict[str, Any]) -> None:
+    if not CFG.export_movies:
+        return
+    aid = account.get("id")
+    aname = account.get("name") or f"Account-{aid}"
+    root = Path(CFG.movies_dir.replace("{XC_NAME}", str(aname)))
+    root.mkdir(parents=True, exist_ok=True) if not CFG.dry_run else None
+    log(f"=== Movies: {aname} -> {root} ===")
+    cfile = cache_file(str(aname), "movies.json")
+    movies = load_cache(cfile)
+    ok = True
+    if movies is None:
+        movies, ok = get_list(f"/api/vod/movies/?m3u_account={aid}", token)
+        if ok:
+            save_cache(cfile, movies)
+    if CFG.test_mode:
+        movies = movies[: CFG.test_limit_movies]
+        log(f"TEST_MODE=true: movies limited to {len(movies)} and cleanup disabled")
+    stats = {"added": 0, "updated": 0, "unchanged": 0, "skipped": 0}
+    expected: set[Path] = set()
+    for i, movie in enumerate(movies, 1):
+        prov = get_provider("movie", movie.get("id"), token)
+        merged = {"movie": movie, "provider": prov}
+        uuid = find_uuid(merged, {"uuid", "movie_uuid", "vod_uuid", "content_uuid"})
+        sid = first_key(merged, {"stream_id", "streamid", "provider_stream_id", "providerstreamid"})
+        if not uuid or sid in (None, ""):
+            stats["skipped"] += 1
+            log(f"WARNING: Skipping movie without UUID/stream_id: {movie.get('name') or movie.get('title') or movie.get('id')}")
+            continue
+        title = clean_title(str(movie.get("name") or movie.get("title") or "Untitled"))
+        year = movie.get("year") or prov.get("year") or ""
+        folder = fs_safe(f"{title} ({year})" if year else title)
+        path = root / item_category(movie) / folder / f"{folder}.strm"
+        expected.add(path)
+        url = f"{CFG.dispatcharr_url}/proxy/vod/movie/{uuid}?{urlencode({'stream_id': sid})}\n"
+        res = write_if_changed(path, url)
+        if res in stats:
+            stats[res] += 1
+        if i == 1 or i == len(movies) or i % 250 == 0:
+            progress(f"Movies {aname}: {i}/{len(movies)} processed")
+    removed = cleanup(root, expected, "movie", ok)
+    log(f"Movies summary for {aname}: {stats['added']} added, {stats['updated']} updated, {stats['unchanged']} unchanged, {removed} removed, {stats['skipped']} skipped")
+
+
+def ep_iter(provider: dict[str, Any]):
+    eps = provider.get("episodes")
+    if isinstance(eps, dict):
+        for skey, arr in eps.items():
+            snum = int(skey) if str(skey).isdigit() else 1
+            for ep in arr if isinstance(arr, list) else []:
+                yield norm_ep(ep, snum)
+    elif isinstance(eps, list):
+        for ep in eps:
+            yield norm_ep(ep, None)
+    else:
+        for season in provider.get("seasons") or provider.get("Seasons") or []:
+            if isinstance(season, dict):
+                snum = int(season.get("number") or season.get("season_number") or season.get("season") or 1)
+                for ep in season.get("episodes") or season.get("Episodes") or []:
+                    yield norm_ep(ep, snum)
+
+
+def norm_ep(ep: Any, fallback_season: int | None):
+    if not isinstance(ep, dict):
+        return None
+    snum = int(ep.get("season_number") or ep.get("season") or ep.get("season_num") or fallback_season or 1)
+    enum = int(ep.get("episode_number") or ep.get("episode_num") or ep.get("num") or ep.get("episode") or 0)
+    if enum <= 0:
+        return None
+    uuid = find_uuid(ep, {"uuid", "episode_uuid", "content_uuid"})
+    if not uuid:
+        return None
+    title = clean_title(str(ep.get("title") or ep.get("name") or ep.get("episode_name") or f"Episode {enum}"))
+    return snum, enum, title, uuid
+
+
+def export_series(token: str | None, account: dict[str, Any]) -> None:
+    if not CFG.export_series:
+        return
+    aid = account.get("id")
+    aname = account.get("name") or f"Account-{aid}"
+    root = Path(CFG.series_dir.replace("{XC_NAME}", str(aname)))
+    root.mkdir(parents=True, exist_ok=True) if not CFG.dry_run else None
+    log(f"=== Series: {aname} -> {root} ===")
+    cfile = cache_file(str(aname), "series.json")
+    shows = load_cache(cfile)
+    ok = True
+    if shows is None:
+        shows, ok = get_list(f"/api/vod/series/?m3u_account={aid}", token)
+        if ok:
+            save_cache(cfile, shows)
+    if CFG.test_mode:
+        shows = shows[: CFG.test_limit_series]
+        log(f"TEST_MODE=true: series limited to {len(shows)} and cleanup disabled")
+    stats = {"added": 0, "updated": 0, "unchanged": 0, "skipped": 0}
+    expected: set[Path] = set()
+    for i, show in enumerate(shows, 1):
+        prov = get_provider("series", show.get("id"), token)
+        show_title = clean_title(str(show.get("name") or show.get("title") or "Untitled"))
+        show_dir = root / item_category(show) / fs_safe(show_title)
+        count = 0
+        for item in ep_iter(prov):
+            if not item:
+                continue
+            snum, enum, etitle, uuid = item
+            count += 1
+            base = fs_safe(f"S{snum:02d}E{enum:02d} - {etitle}")
+            path = show_dir / f"Season {snum:02d}" / f"{base}.strm"
+            expected.add(path)
+            url = f"{CFG.dispatcharr_url}/proxy/vod/episode/{uuid}?{urlencode({'m3u_account_id': aid})}\n"
+            res = write_if_changed(path, url)
+            if res in stats:
+                stats[res] += 1
+        if count == 0:
+            stats["skipped"] += 1
+        if i == 1 or i == len(shows) or i % 100 == 0:
+            progress(f"Series {aname}: {i}/{len(shows)} processed")
+    removed = cleanup(root, expected, "series", ok)
+    log(f"Series summary for {aname}: {stats['added']} added, {stats['updated']} updated, {stats['unchanged']} unchanged, {removed} removed, {stats['skipped']} skipped")
+
+
 def main() -> int:
     log("=== VOD2strm incremental STRM sync started ===")
-    log(f"Dispatcharr URL: {CONFIG.dispatcharr_url}")
-    log(f"STRM-only fast mode: {'yes' if not CONFIG.enable_nfo else 'no, ENABLE_NFO=true'}")
-
-    if CONFIG.enable_nfo:
-        log("ENABLE_NFO=true is set, but this rewrite currently focuses on STRM generation only. No TMDB queries are performed.")
-    if CONFIG.dry_run:
-        log("DRY_RUN=true: no files or caches will be written or deleted.")
-
-    if CONFIG.clear_cache and CONFIG.cache_dir.exists():
-        if CONFIG.dry_run:
-            log(f"[dry-run] Would clear cache directory only: {CONFIG.cache_dir}")
+    log(f"Dispatcharr URL: {CFG.dispatcharr_url}")
+    if CFG.test_mode:
+        log("TEST_MODE=true: processing is limited and DELETE_OLD is forced off")
+    if CFG.dry_run:
+        log("DRY_RUN=true: no files will be written or deleted")
+    if CFG.clear_cache and CFG.cache_dir.exists():
+        if CFG.dry_run:
+            log(f"[dry-run] Would clear cache directory: {CFG.cache_dir}")
         else:
-            shutil.rmtree(CONFIG.cache_dir, ignore_errors=True)
-            log(f"Cleared cache directory only: {CONFIG.cache_dir}")
-
-    token = api_login()
+            shutil.rmtree(CFG.cache_dir, ignore_errors=True)
+            log(f"Cleared cache directory: {CFG.cache_dir}")
     global _CURRENT_TOKEN
-    _CURRENT_TOKEN = token
-
-    accounts = [account for account in get_accounts(token) if account_matches(account.get("name") or "")]
-    if not accounts:
-        log(f"No Dispatcharr M3U/XC accounts matched: {CONFIG.xc_names}")
+    _CURRENT_TOKEN = api_login()
+    accounts, ok = get_accounts(_CURRENT_TOKEN)
+    if not ok:
+        log("ERROR: Could not fetch Dispatcharr accounts")
         return 1
-
-    log(f"Matched {len(accounts)} account(s): {', '.join(str(a.get('name') or a.get('id')) for a in accounts)}")
+    accounts = [a for a in accounts if any(fnmatch.fnmatch(a.get("name") or "", p) for p in CFG.account_filters)]
+    if not accounts:
+        log(f"No M3U/XC accounts matched: {CFG.account_filters}")
+        return 1
+    log("Matched accounts: " + ", ".join(str(a.get("name") or a.get("id")) for a in accounts))
     for account in accounts:
-        export_movies_for_account(token, account)
-        export_series_for_account(token, account)
-
+        export_movies(_CURRENT_TOKEN, account)
+        export_series(_CURRENT_TOKEN, account)
     log("=== VOD2strm incremental STRM sync finished ===")
     return 0
 
