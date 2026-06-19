@@ -7,6 +7,10 @@ Safety rules:
 - TEST_MODE may limit processing, but stale deletion is automatically disabled.
 - Stale cleanup only runs after successful catalog fetches and never when expected files are empty.
 - The Movies/Series root directories are never removed.
+
+Performance rules:
+- Movies use UUID/stream_id from the catalog response when available.
+- Movie provider-info is called only as a fallback when the catalog item is missing UUID or stream_id.
 """
 from __future__ import annotations
 
@@ -132,7 +136,7 @@ def build_config() -> Config:
         test_limit_series=as_int("TEST_LIMIT_SERIES", 20) or 20,
         page_size=as_int("PAGE_SIZE", 250) or 250,
         log_level=setting("LOG_LEVEL", "INFO").strip().upper(),
-        user_agent=setting("HTTP_USER_AGENT", "VOD2strm/1.2"),
+        user_agent=setting("HTTP_USER_AGENT", "VOD2strm/1.3"),
     )
 
 
@@ -375,6 +379,23 @@ def save_cache(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
 
+def movie_ids_from_catalog(movie: dict[str, Any]) -> tuple[str | None, Any | None]:
+    uuid = find_uuid(movie, {"uuid", "movie_uuid", "vod_uuid", "content_uuid"})
+    stream_id = first_key(movie, {"stream_id", "streamid", "provider_stream_id", "providerstreamid"})
+    return uuid, stream_id
+
+
+def movie_ids_with_fallback(movie: dict[str, Any], token: str | None) -> tuple[str | None, Any | None, dict[str, Any], bool]:
+    uuid, stream_id = movie_ids_from_catalog(movie)
+    if uuid and stream_id not in (None, ""):
+        return uuid, stream_id, {}, False
+    provider = get_provider("movie", movie.get("id"), token)
+    merged = {"movie": movie, "provider": provider}
+    uuid = uuid or find_uuid(provider, {"uuid", "movie_uuid", "vod_uuid", "content_uuid"}) or find_uuid(merged, {"uuid", "movie_uuid", "vod_uuid", "content_uuid"})
+    stream_id = stream_id if stream_id not in (None, "") else first_key(provider, {"stream_id", "streamid", "provider_stream_id", "providerstreamid"})
+    return uuid, stream_id, provider, True
+
+
 def export_movies(token: str | None, account: dict[str, Any]) -> None:
     if not CFG.export_movies:
         return
@@ -393,13 +414,12 @@ def export_movies(token: str | None, account: dict[str, Any]) -> None:
     if CFG.test_mode:
         movies = movies[: CFG.test_limit_movies]
         log(f"TEST_MODE=true: movies limited to {len(movies)} and cleanup disabled")
-    stats = {"added": 0, "updated": 0, "unchanged": 0, "skipped": 0}
+    stats = {"added": 0, "updated": 0, "unchanged": 0, "skipped": 0, "provider_fallback": 0}
     expected: set[Path] = set()
     for i, movie in enumerate(movies, 1):
-        prov = get_provider("movie", movie.get("id"), token)
-        merged = {"movie": movie, "provider": prov}
-        uuid = find_uuid(merged, {"uuid", "movie_uuid", "vod_uuid", "content_uuid"})
-        sid = first_key(merged, {"stream_id", "streamid", "provider_stream_id", "providerstreamid"})
+        uuid, sid, prov, used_provider = movie_ids_with_fallback(movie, token)
+        if used_provider:
+            stats["provider_fallback"] += 1
         if not uuid or sid in (None, ""):
             stats["skipped"] += 1
             log(f"WARNING: Skipping movie without UUID/stream_id: {movie.get('name') or movie.get('title') or movie.get('id')}")
@@ -416,7 +436,11 @@ def export_movies(token: str | None, account: dict[str, Any]) -> None:
         if i == 1 or i == len(movies) or i % 250 == 0:
             progress(f"Movies {aname}: {i}/{len(movies)} processed")
     removed = cleanup(root, expected, "movie", ok)
-    log(f"Movies summary for {aname}: {stats['added']} added, {stats['updated']} updated, {stats['unchanged']} unchanged, {removed} removed, {stats['skipped']} skipped")
+    log(
+        f"Movies summary for {aname}: {stats['added']} added, {stats['updated']} updated, "
+        f"{stats['unchanged']} unchanged, {removed} removed, {stats['skipped']} skipped, "
+        f"{stats['provider_fallback']} provider-info fallback calls"
+    )
 
 
 def ep_iter(provider: dict[str, Any]):
